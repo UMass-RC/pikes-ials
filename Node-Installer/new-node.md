@@ -1,4 +1,4 @@
-How to Provision New Pikes Nodes:
+# Provisioning new Pikes Nodes (With BMC Patch) #
 
 1. In the file /cm/node-installer/scripts/node-installer.conf, set "setupBMC" to "true" (This should be false when not adding new nodes)
 1. Provision using node wizard in Bright CM like normal, and if the BMC controller is configured successfully, great. If not:
