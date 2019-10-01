@@ -1,0 +1,542 @@
+#!/usr/bin/perl
+
+#
+# Copyright (c) 2004-2014 Bright Computing Holding BV. All Rights Reserved.
+#
+# This software is the confidential and proprietary information of
+# Bright Computing Holding BV ("Confidential Information").  You shall not
+# disclose such Confidential Information and shall use it only in
+# accordance with the terms of the license agreement you entered into
+# with Bright Computing Holding BV or its subsidiaries.
+
+use Getopt::Long;
+use constant CONSOLE => 1;
+use constant LOG => 2;
+use strict;
+
+#----------- FORWARD DECLARATIONS --------------
+sub runIpmitool;
+sub createDevice;
+sub getLanChannel;
+sub tryUserId;
+sub enableiDRACPrivileges;
+#-----------------------------------------------
+
+my $ipmitool = "/cm/local/apps/ipmitool/current/ipmitool";
+# my $failOnMissingIpmi;
+our $verbose = 0;
+our $quiet = 0;
+my $help;
+
+# the exitcode is global! Which we use in the execute function
+our $exitcode;
+our $output;
+our %users;
+
+doPrint( "Configuring IPMI interface.", LOG );
+
+my $r = GetOptions( "ipmitool=s" => \$ipmitool,
+                    "verbose" => \$verbose,
+                    "quiet" => \$quiet,
+                    "help|?" => \$help );
+
+$verbose = $verbose ? 1 : 0;
+$quiet = $quiet ? 1 : 0;
+
+if( !$ipmitool ) {
+  $verbose = 1;
+  usage( "ipmitool binary not found. " );
+}
+
+my $interfaces = $ENV{"CMD_INTERFACES"};
+my $ip;
+my $netmask;
+my $dhcp;
+my $type;
+my $gateway;
+my $vlanid;
+our $name = "";
+
+if(!$interfaces ) {
+  doPrint ("No IPMI interfaces given as input!");
+  doExit(1);
+}
+
+
+
+foreach my $interface ( split( " " ,  $interfaces ) ) {
+  my $type_temp = $ENV{"CMD_INTERFACE_" . $interface . "_TYPE"};
+  if( $type_temp =~ /bmc/i ) {
+    $ip = $ENV{"CMD_INTERFACE_" . $interface . "_IP"};
+    $netmask = $ENV{"CMD_INTERFACE_" . $interface . "_NETMASK"};
+    $dhcp=$ENV{"CMD_INTERFACE_" . $interface . "_DHCP"};
+    $gateway=$ENV{"CMD_INTERFACE_" . $interface . "_GATEWAY"};
+    $vlanid=$ENV{"CMD_INTERFACE_" . $interface . "_VLANID"};
+    $type = $type_temp;
+    $name = $interface;
+    $name =~ s/cimc/ipmi/g if ( $name =~ /cimc/ );
+    $name =~ s/drac/ipmi/g if ( $name =~ /drac/ );
+    last;
+  }
+}
+
+my $bmcUserId=$ENV{"CMD_BMCUSERID"};
+my $bmcUserName=$ENV{"CMD_BMCUSERNAME"};
+my $bmcPassword=$ENV{"CMD_BMCPASSWORD"};
+my $enable_nic="Y";
+my $failOnMissingBMC=$ENV{"CMD_FAILONMISSINGBMC"};
+
+$failOnMissingBMC = $failOnMissingBMC ? 1 : 0;
+
+my $strictUserId=$ENV{"CMD_STRICTUSERID"};
+
+$strictUserId = $strictUserId ? 1 : 0;
+
+my $fujitsuMode = 0;
+
+my $ciscoucs = 0;
+
+if( !$vlanid ) {
+  $vlanid = 0;
+}
+
+if( !$interfaces || !$ip || !$netmask || !$dhcp || !$bmcUserName ||
+    !$bmcPassword || !$bmcUserId || !$name || !($type =~ /bmc/i) ) {
+  my $message;
+  if( !$interfaces ) {
+    $message = "$message CMD_INTERFACES";
+  }
+  if( !$ip ) {
+    $message = "$message CMD_INTERFACE_<bmc>_IP";
+  }
+  if( !$netmask ) {
+    $message = "$message CMD_INTERFACE_<bmc>_NETMASK";
+  }
+  if( !$dhcp ) {
+    $message = "$message CMD_INTERFACE_<bmc>_DHCP";
+  }  
+  if( !$type ) {
+    $message = "$message CMD_INTERFACE_<bmc>_TYPE";
+  }
+  if( !($type =~ /bmc/i) ) {
+    $message = "$message CMD_INTERFACE_<bmc>_TYPE=bmc";
+  }
+  if( !$bmcUserName ) {
+    $message = "$message CMD_BMCUSERNAME";
+  }
+  if( !$bmcPassword ) {
+    $message = "$message CMD_BMCPASSWORD";
+  }
+  if( !$bmcUserId ) {
+    $message = "$message CMD_BMCUSERID";
+  }
+  if( $message ) {
+    $message = "Missing environment variable(s): $message.";
+  }
+  usage( $message );
+}
+
+#-------------------- LET's START THE REAL THING ------------
+
+my $res = createDevice();
+if( $res eq 0 ) {
+  doExit( 1 );
+}
+
+my $lanChannel = getLanChannel();
+if( $lanChannel eq -1 ) {
+  doPrint( "Failed to determine LAN channel for $name.", CONSOLE );
+  doExit( 1 );
+}
+
+runIpmitool( "-I open lan set $lanChannel access on", 1 );
+
+if ( $dhcp eq "YES" ){
+  runIpmitool( "-I open lan set $lanChannel ipsrc dhcp", 1 );
+
+} else {
+  runIpmitool( "-I open lan set $lanChannel ipsrc static", 1 );
+  
+  runIpmitool( "-I open lan set $lanChannel ipaddr $ip", 1 );
+
+  runIpmitool( "-I open lan set $lanChannel netmask $netmask", 1 );
+  
+  if ( $gateway && ($gateway != "0.0.0.0" ) ) {
+    runIpmitool( "-I open lan set $lanChannel defgw ipaddr $gateway", 1 );  
+  }
+}
+
+
+readUsers();
+
+if( $strictUserId eq 1 ) {
+  tryUserId( $lanChannel, $bmcUserId, $bmcUserName, $bmcPassword, 1 );
+} else {
+  tryUserId( $lanChannel, $bmcUserId, $bmcUserName, $bmcPassword, 0 );
+  if( $exitcode ne 0 ) {
+    doPrint( "WARNING: Configuring IPMI interface using configured user ID failed.", CONSOLE );
+    doPrint( "Trying alternative user ID's.", CONSOLE );
+    my $orgId = $bmcUserId;
+    for( $bmcUserId = 1; $bmcUserId < 11; $bmcUserId++ ) {
+      if( $bmcUserId eq $orgId ) {
+        next;
+      }
+      tryUserId( $lanChannel, $bmcUserId, $bmcUserName, $bmcPassword, 0 );
+      if( $exitcode eq 0 ) {
+        doPrint( "User ID $bmcUserId seems to work, consider updating the configuration.", CONSOLE );
+        last;
+      }
+    }
+    if( $exitcode ne 0 ) {
+      doPrint( "Can't find a working user ID for the IPMI interface!", CONSOLE );
+      doExit( 1 );
+    }
+  }
+}
+
+setupVlan( $vlanid, $lanChannel );
+
+# This is a temporary workaround for enabling iDRAC management privileges
+# for the bright bmc user. Right now this is not possible using 'ipmitool',
+# so we need to use 'racadm' to accomplish this. This operation is 
+# performed only for supported Dell Rx servers. See below for a list of 
+# supported servers.
+my @supported_dellrx_servers = ("R730xd", "R730", "FC430", "FC630", "FC830", "M830", "C6320");
+enableiDRACPrivileges( $ip, $bmcUserId, \@supported_dellrx_servers );
+
+doPrint( "Configured IPMI interface $name, ip $ip.", CONSOLE );
+doPrint( "Configured IPMI interface $name, netmask $netmask, DHCP $dhcp, VLAN ID $vlanid, user ID $bmcUserId, user name $bmcUserName.", LOG );
+doExit( 0 );
+
+
+#---------------------------- THE FUNCTIONS ---------------------------------
+
+sub setupVlan() {
+  my $vlanid = shift;
+  my $lanChannel = shift;
+  my $currentVlanId = readVlanId();
+
+  if( $currentVlanId eq "" && $vlanid != 0 ) {
+    doPrint( "IPMI card does not seem to have VLAN support, ignoring VLAN setting.", CONSOLE );
+    return;
+  }
+
+  if( $currentVlanId == -1 ) {
+    doPrint( "Can't determine currently configured vlan id.", LOG );
+    if( $vlanid != 0 ) {
+      doPrint( "Attempting to set vlan id $vlanid.", LOG );
+      runIpmitool( "-I open lan set $lanChannel vlan id $vlanid", 1 );
+    }
+  } else {
+    if( $vlanid == 0 ) {
+      $vlanid = "off";
+    }
+    if( $currentVlanId eq "Disabled" ) {
+      $currentVlanId = "off";
+    }
+
+    if( $currentVlanId eq $vlanid ) {
+      if( $vlanid eq "off" ) {
+        doPrint( "No need to set vlan id.", LOG );
+      } else {
+        doPrint( "Resetting vlan id to $vlanid.", LOG );
+        runIpmitool( "-I open lan set $lanChannel vlan id $vlanid", 1 )
+      }
+    } else {
+      doPrint( "Currently configured vlan id: $currentVlanId, setting to $vlanid.", LOG );
+      runIpmitool( "-I open lan set $lanChannel vlan id $vlanid", 1 );
+    }
+  }
+}
+
+sub readVlanId() {
+  my $command = "$ipmitool -I open lan print 1 | grep \"802.1q VLAN ID\" | sed 's/\\ //g' | cut -d':' -f2";
+  $output = `($command) 2>&1`;
+  $exitcode = $? >> 8;
+  if( $exitcode ne 0 ) {
+    return -1;
+  } else {
+    chomp $output;
+    return $output;
+  }
+}
+
+sub readUsers() {
+  # get the user list
+  $exitcode = runIpmitool( "-I open -c user list $lanChannel", 0 );
+  my @lines = split( /\n/, $output );
+  foreach my $line (@lines) {
+    my @fields = split( ",", $line );
+    if( $fields[1] ne "" ) {
+      $users{$fields[0]} = $fields[1];
+    }
+  }
+
+  if( $exitcode ne 0 ) {
+    foreach my $line (@lines) {
+      doPrint( $line );
+      if( $line =~ /^Get User Access command failed \(channel [0-9]+, user [0-9]+\): Unknown \(0x32\)/ ) {
+        runIpmitool( "-I open -c bmc info", 1 );
+        my @lines = split( /\n/, $output );
+        foreach my $line (@lines) {
+          if( $line =~ /^Manufacturer Name.+Fujitsu Siemens$/ ) {
+            $fujitsuMode = 1;
+            doPrint( "fujitsu bug mode" );
+          }
+        }
+      } 
+    }
+    if( !$fujitsuMode ) {
+      doPrint( "Failed to list users for $name.", CONSOLE );
+      doExit( 1 );
+    }
+  }
+}
+
+sub tryUserId() {
+  my $lanChannel = shift;
+  my $bmcUserId = shift;
+  my $bmcUserName = shift;
+  my $bmcPassword = shift;
+  my $exitOnFail = shift;
+
+  $exitcode = 0;
+  if( $users{$bmcUserId} ne $bmcUserName ) {
+    $exitcode = runIpmitool( "-I open user set name $bmcUserId \"\$CMD_BMCUSERNAME\"", $exitOnFail );
+  }
+  if( $exitcode eq 0 ) {
+    $exitcode = runIpmitool( "-I open user set password $bmcUserId \"\$CMD_BMCPASSWORD\"", $exitOnFail ); 
+    if( $exitcode eq 0 ) {
+      if( $fujitsuMode ) {
+        $exitcode = runIpmitool( "-I open user enable $bmcUserId", $exitOnFail );
+      }
+      if( $exitcode eq 0 ) {
+        $exitcode = runIpmitool( "-I open channel setaccess $lanChannel $bmcUserId callin=on ipmi=on link=on privilege=4", $exitOnFail );
+        if ( $exitcode ne 0 ) {
+          checkifCiscoUCS();
+          if ( $ciscoucs ) {
+            $exitcode = runIpmitool( "raw 0x6 0x43 $lanChannel $bmcUserId 4 0", $exitOnFail );
+          } 
+        } 
+        if ( $exitcode eq 0 ) {
+          $exitcode = runIpmitool( "-I open user enable $bmcUserId", $exitOnFail );
+        }
+      }
+    }
+  }
+}
+
+sub checkifCiscoUCS() {
+
+  # Temporary suggestion/workaround from Cisco, to send raw ipmi commands when setting admin privileges
+  # for bmc user. This check can be disabled when CIMC firmware is upgraded to > 1.5.1f (?). 
+  # Firmware version in which fix will be available is not known at the moment of implementing this. 
+
+  my $mainexitcode = $exitcode;
+  my $checkbmcinfo = 0;
+  my @lines = split( /\n/, $output );
+  foreach my $line (@lines) {
+    if( $line =~ /^Set User Access \(channel [0-9]+ id [0-9]+\) failed: Command not supported in present state/ ) {
+      $checkbmcinfo = 1;              
+    }
+  }
+  if ( $checkbmcinfo ) {
+
+    # Unfortunately the UCS CIMC does not provide any useful information regarding the BMC, when
+    # queried with  'ipmitool bmc info'. So we run the following command to determine atleast
+    # the product manufacturer.
+
+    my $fruexit = runIpmitool( "fru", 1 );
+    if ( $fruexit eq 0 ) {
+      my @lines = split( /\n/, $output );
+      foreach my $line (@lines) {
+	print "$line\n";
+	if( $line =~ /Product Manufacturer.+Cisco Systems/ ) {
+	  $ciscoucs = 1;
+	}
+      }
+    }
+
+    # We have to set $exitcode back to original, because $exitcode is global
+    # and gets reset whenever an ipmitool command is run.
+    $exitcode = $mainexitcode;
+  }
+}
+
+sub enableiDRACPrivileges() {
+  my $bmc_ip_address = shift;
+  my $bmc_userid = shift;
+  my @servers = @{$_[0]};
+  
+  doPrint("Checking if server is one of Dell 13G models", LOG);
+  my $server = `/usr/sbin/dmidecode | /bin/grep Product | /usr/bin/head -1 | /usr/bin/awk '{print \$NF}' 2>/dev/null`;
+  chomp($server);
+  if ( grep{$_ eq $server} @servers ) {
+    my $racadm = "/opt/dell/srvadmin/sbin/racadm";
+    if ( -e $racadm ) {
+     
+      # Local racadm commands (in-band) require service 'dataeng' to be running
+      # Since starting this service involves writing to the read-only filesytem (/opt/dell)
+      # we cannot start the service. For now, we just run remote racadm commands as user
+      # BMC user 'root' and set the iDRAC management privilege for the bright BMC user.
+     
+      doPrint("Enabling iDRAC management privileges for user id: $bmc_userid", CONSOLE);
+      my $cmd = "$racadm -r $bmc_ip_address -u root -p calvin set iDRAC.Users.$bmc_userid.Privilege 511";
+      my $racadm_output = `($cmd) 2>&1`;
+      my $racadm_exitcode = $? >> 8;
+      if( $exitcode ne 0 ) {
+        doPrint("$racadm_output.", LOG);
+        doPrint("Failed to enable iDRAC management privileges for user id: $bmc_userid", CONSOLE);
+      } else {
+        doPrint("Successfully enabled iDRAC management privileges for user id: $bmc_userid", CONSOLE);
+      }
+    } else {
+      doPrint("racadm is not installed, cannot set iDRAC management privileges for user id: $bmc_userid.", LOG);
+    }
+  } 
+}
+
+sub runIpmitool() {
+  my $args = shift;
+  my $exitOnFail = shift;
+  my $command = "$ipmitool mc reset cold; $ipmitool $args";
+
+  my $output = execute( $command );
+  if( $exitcode ne 0 ) {
+    doPrint( "Running ipmitool failed with exitcode: $exitcode.", LOG );
+    if( $exitOnFail eq 1 ) {
+      doExit( 1 );
+    }
+  }
+  return $exitcode;
+}
+
+
+sub createDevice() {
+  $exitcode = -1;
+  my $output = "";
+  my $devicename = "/dev/$name";
+  my $permissions = "0644";
+  my $procEntry = "/sys/class/ipmi/$name/dev";
+
+  if( -e $devicename ) {
+    doPrint( "Device $devicename already exists.", LOG );
+    return 1; # not really an problem
+  }
+    
+  if( -e $procEntry ) {
+    $output = execute( "cat $procEntry" );
+  }
+
+  if( $exitcode ne 0 ) {
+    if( $failOnMissingBMC eq 1 ) {
+      doPrint( "ERROR: Failed to detect interface $name.", CONSOLE );
+      doPrint( "Please add IPMI drivers to softwareimage kernelmodules.", CONSOLE );
+	    return 0; # a show stopper
+    } else {
+      doPrint( "WARNING: Failed to detect interface $name, skipping", CONSOLE );
+      doPrint( "Please add IPMI drivers to softwareimage kernelmodules.", CONSOLE );
+      exit( 0 ); # not a show stopper, but this script is over
+    }
+  }
+
+  $output =~ /([0-9]{1,3}):([0-9]{1,3})/;    
+  my $major = $1;
+  my $minor = $2;
+  if(!$major) {
+    doPrint("Error parsing /sys/class/ipmi/$name/dev: $output.", LOG);
+    return 0;
+  }
+
+  my $mknod = "mknod $devicename c $major $minor";
+  execute( $mknod );
+  if( $exitcode ne 0 ) {
+    execute( "chmod $permissions $devicename" );
+    if( $exitcode ne 0 ) {
+      doPrint( "Failed to chmod $devicename.", LOG );
+      return 0;
+    }
+    doPrint( "Failed to create $devicename.", LOG );
+    doPrint( "$mknod", LOG );
+    return 0;
+  }
+
+  return 1;
+}
+
+sub getLanChannel() {
+  my $lanChannel = -1;
+  my $channel = 0;
+  for( $channel = 0; $channel < 16; $channel++ ) {
+    my $command = "$ipmitool -I open channel info $channel";
+    my @output = `$command 2>&1`;
+    $exitcode = $? >> 8;
+
+    if( $exitcode ne 0 ) {
+      next;
+    }
+    my $line;
+    foreach $line (@output) {
+      if( $line =~ /Channel Medium Type/i && $line =~ /802\.3 LAN/ ) {
+        $lanChannel = $channel;
+        doPrint( "Detected $name LAN channel=$lanChannel.", LOG );
+        return $lanChannel;
+      }
+    }
+
+    if( $lanChannel ne -1 ) {
+      last;
+    }
+  }
+  return $lanChannel;
+}
+
+sub doExit {
+  my $exitcode = shift;
+  if( $name ) {
+    $name = " $name";
+  }
+  if( $exitcode ne 0 ) {
+    doPrint( "Failed to start IPMI interface $name.", CONSOLE );
+  }
+  exit( $exitcode );
+}
+
+sub doPrint {
+  my $mess = shift;
+  my $type = shift;
+  if( $quiet eq 1 ) {
+    if( $type eq CONSOLE ) {
+      print( "$mess\r\n" );
+    }
+    return;
+  }
+  if( $type eq CONSOLE ) {
+    print( "CONSOLE:$mess\n" );
+  } else {
+    print "$mess\n";
+  }
+}
+
+sub usage {
+  my $message = shift;
+  if( $verbose eq 1 ) {
+    doPrint( "Usage: configure_ipmi.pl [--ipmitool=<path to ipmi tool>] [--verbose]", LOG) ;
+    doPrint( "Additional, certain environment is required. $message.", LOG );
+  } else {
+    doPrint( $message, LOG );
+  }
+  doExit( 1 );
+}
+
+sub execute {
+  my $command = shift;
+  $output = `($command) 2>&1`;
+  $exitcode = $? >> 8;
+  if( $exitcode ne 0 ) {
+    doPrint( "Command '" . $command ."' failed. Exitcode: $exitcode", LOG );
+    doPrint( "Command returned:", LOG );
+    doPrint( "$output", LOG );
+  }
+  return $output;
+}
